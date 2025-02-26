@@ -1,4 +1,4 @@
-module.exports = async function (tp, jiraQuery, accountAliases) {
+module.exports = async function (tp, jiraQuery, accountAliases, statusToHeadingMap = {}) {
   // Function to update the Kanban file with Jira tasks
   async function updateKanbanWithJiraTasks() {
     // Get the currently opened file
@@ -68,10 +68,8 @@ module.exports = async function (tp, jiraQuery, accountAliases) {
         continue;
       }
 
-      // Find the matching header
-      const headerIndex = headers.indexOf(status);
-      console.log(`headerIndex of ${status}: ${headerIndex}`);
-      const targetHeader = headerIndex !== -1 ? headers[headerIndex] : 'To Sort';
+      // Find the matching header using the statusToHeadingMap
+      const targetHeader = statusToHeadingMap[status] || status;
 
       // Find the position of the target header
       const headerRegex = new RegExp(`##\\s+${targetHeader}\\n`, 'g');
@@ -81,12 +79,20 @@ module.exports = async function (tp, jiraQuery, accountAliases) {
         // Find the position of the header in the content
         const headerPosition = kanbanContent.indexOf(`## ${targetHeader}\n`);
 
-        // Check if there is a `**Complete**` line below the header
+        // Find the next header position (if any) to determine the section boundaries
+        const nextHeaderPosition = kanbanContent.indexOf('## ', headerPosition + 1);
+        const sectionEnd = nextHeaderPosition !== -1 ? nextHeaderPosition : kanbanContent.length;
+
+        // Check if there is a `**Complete**` line within this header's section
+        const sectionContent = kanbanContent.substring(headerPosition, sectionEnd);
         const completeMarker = `**Complete**`;
-        const completeMarkerPosition = kanbanContent.indexOf(completeMarker, headerPosition);
+        const hasCompleteMarker = sectionContent.includes(completeMarker);
+
         let insertPosition = 0;
-        if (completeMarkerPosition !== -1) {
-          // If `**Complete**` exists below the header, insert the task below it
+        if (hasCompleteMarker) {
+          // If `**Complete**` exists within this section, insert the task below it
+          const completeMarkerRelativePosition = sectionContent.indexOf(completeMarker);
+          const completeMarkerPosition = headerPosition + completeMarkerRelativePosition;
           insertPosition = completeMarkerPosition + completeMarker.length + 1; // +1 for the newline
         } else {
           // If `**Complete**` does not exist, insert the task directly below the header
@@ -124,7 +130,6 @@ module.exports = async function (tp, jiraQuery, accountAliases) {
 
     // Call the plugin's getSearchResults method (correct method according to documentation)
     const searchResults = await $ji.defaulted.getSearchResults(query, { account });
-    console.log(searchResults);
     // Format the results into a consistent structure
     return searchResults.issues.map(issue => ({
       key: issue.key,
