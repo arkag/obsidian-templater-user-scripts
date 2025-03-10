@@ -60,7 +60,7 @@ module.exports = async function (tp, jiraQuery, accountAliases, statusToHeadingM
       if (fileExists) {
         fileDisplayName = fileExists.basename;
       } else {
-        fileDisplayName = await tp.file.create_new(tp.file.find_tfile("Jira Ticket"), task.key).basename;
+        fileDisplayName = (await tp.file.create_new(tp.file.find_tfile("Jira Ticket"), task.key)).basename;
       }
 
       // Check if the task already exists in the file
