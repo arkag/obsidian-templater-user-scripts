@@ -46,69 +46,156 @@ module.exports = async function (tp, jiraQuery, accountAliases, statusToHeadingM
       jiraTasks = jiraTasks.concat(tasks);
     }
 
-    // Dynamically pull headers from the file content
-    const headers = extractHeadersFromContent(kanbanContent);
+    console.log(`Found ${jiraTasks.length} Jira tasks to process`);
 
-    // Process each Jira task
-    for (const task of jiraTasks) {
-      const status = task.fields.status.name;
-      const taskDescription = `- [ ] [[${task.key}]]\n`;
-      const fileName = `${task.key}.md`;
-      const fileExists = tp.file.find_tfile(fileName);
+    // Create a map of Jira keys to their current status for quick lookup
+    const jiraStatusMap = {};
+    jiraTasks.forEach(task => {
+      jiraStatusMap[task.key] = task.fields.status.name;
+    });
 
-      let fileDisplayName;
-      if (fileExists) {
-        fileDisplayName = fileExists.basename;
-      } else {
-        fileDisplayName = (await tp.file.create_new(tp.file.find_tfile("Jira Ticket"), task.key)).basename;
-      }
+    // First, add new tasks that don't exist in the Kanban
+    console.log('Starting to add new tasks to Kanban board');
+    const addResult = await addNewTasks(kanbanContent, jiraTasks, statusToHeadingMap, activeFile);
+    kanbanContent = addResult.content;
 
-      // Check if the task already exists in the file
-      if (kanbanContent.includes(`${task.key}`)) {
-        continue;
-      }
+    // Output the number of tasks added
+    if (addResult.addedCount > 0) {
+      console.log(`Successfully added ${addResult.addedCount} new tasks to the Kanban board`);
+    } else {
+      console.log('No new tasks were added to the Kanban board');
+    }
 
-      // Find the matching header using the statusToHeadingMap
-      const targetHeader = statusToHeadingMap[status] || status;
+    // Now, update existing tasks based on their current Jira status
+    console.log('Starting to update existing tasks in Kanban board');
+    await updateExistingTasks(kanbanContent, jiraStatusMap, statusToHeadingMap, activeFile);
+  }
 
-      // Find the position of the target header
-      const headerRegex = new RegExp(`##\\s+${targetHeader}\\n`, 'g');
-      const headerMatch = kanbanContent.match(headerRegex);
+  // New function to update existing tasks in the Kanban board
+  async function updateExistingTasks(kanbanContent, jiraStatusMap, statusToHeadingMap, activeFile) {
+    // Extract all task references from the Kanban content
+    const taskRegex = /- \[[ x]\] \[\[([A-Z]+-\d+)\]\]/g;
+    let match;
+    const tasksToUpdate = [];
 
-      if (headerMatch) {
-        // Find the position of the header in the content
-        const headerPosition = kanbanContent.indexOf(`## ${targetHeader}\n`);
-
-        // Find the next header position (if any) to determine the section boundaries
-        const nextHeaderPosition = kanbanContent.indexOf('## ', headerPosition + 1);
-        const sectionEnd = nextHeaderPosition !== -1 ? nextHeaderPosition : kanbanContent.length;
-
-        // Check if there is a `**Complete**` line within this header's section
-        const sectionContent = kanbanContent.substring(headerPosition, sectionEnd);
-        const completeMarker = `**Complete**`;
-        const hasCompleteMarker = sectionContent.includes(completeMarker);
-
-        let insertPosition = 0;
-        if (hasCompleteMarker) {
-          // If `**Complete**` exists within this section, insert the task below it
-          const completeMarkerRelativePosition = sectionContent.indexOf(completeMarker);
-          const completeMarkerPosition = headerPosition + completeMarkerRelativePosition;
-          insertPosition = completeMarkerPosition + completeMarker.length + 1; // +1 for the newline
-        } else {
-          // If `**Complete**` does not exist, insert the task directly below the header
-          insertPosition = headerPosition + `## ${targetHeader}\n`.length;
-        }
-
-        // Insert the task at the correct position
-        kanbanContent = kanbanContent.slice(0, insertPosition) + taskDescription + kanbanContent.slice(insertPosition);
-      } else {
-        // If the header does not exist, add the header and the task
-        kanbanContent += `\n## ${targetHeader}\n${taskDescription}`;
+    while ((match = taskRegex.exec(kanbanContent)) !== null) {
+      const taskKey = match[1];
+      if (jiraStatusMap[taskKey]) {
+        tasksToUpdate.push({
+          key: taskKey,
+          status: jiraStatusMap[taskKey],
+          fullMatch: match[0],
+          position: match.index
+        });
       }
     }
 
-    // Write the updated content back to the active file
-    await app.vault.modify(activeFile, kanbanContent);
+    console.log(`Found ${tasksToUpdate.length} existing tasks to update`);
+
+    // Extract all headers and their positions
+    const headers = [];
+    const headerRegex = /##\s+(.+)\n/g;
+    while ((match = headerRegex.exec(kanbanContent)) !== null) {
+      headers.push({
+        name: match[1],
+        position: match.index,
+        length: match[0].length
+      });
+    }
+
+    // Sort headers by position (descending) to avoid position shifts when modifying content
+    headers.sort((a, b) => b.position - a.position);
+
+    // Create sections map based on headers
+    const sections = {};
+    for (let i = 0; i < headers.length; i++) {
+      const currentHeader = headers[i];
+      const nextHeader = headers[i + 1];
+      const sectionStart = currentHeader.position + currentHeader.length;
+      const sectionEnd = nextHeader ? nextHeader.position : kanbanContent.length;
+
+      sections[currentHeader.name] = {
+        start: sectionStart,
+        end: sectionEnd,
+        content: kanbanContent.substring(sectionStart, sectionEnd)
+      };
+    }
+
+    // Process tasks to update (in reverse order to maintain positions)
+    tasksToUpdate.sort((a, b) => b.position - a.position);
+
+    let updatedContent = kanbanContent;
+    let tasksUpdated = 0;
+
+    for (const task of tasksToUpdate) {
+      // Find which section the task is currently in
+      let currentSection = null;
+      for (const [headerName, section] of Object.entries(sections)) {
+        if (task.position >= section.start && task.position < section.end) {
+          currentSection = headerName;
+          break;
+        }
+      }
+
+      if (!currentSection) {
+        console.log(`Could not determine current section for task ${task.key}`);
+        continue;
+      }
+
+      // Determine target section based on Jira status
+      const targetHeader = statusToHeadingMap[task.status] || task.status;
+
+      // If task is already in the correct section, skip it
+      if (currentSection === targetHeader) {
+        console.log(`Task ${task.key} is already in the correct section: ${targetHeader}`);
+        continue;
+      }
+
+      console.log(`Moving task ${task.key} from "${currentSection}" to "${targetHeader}"`);
+
+      // Remove task from current position
+      updatedContent = updatedContent.slice(0, task.position) +
+        updatedContent.slice(task.position + task.fullMatch.length);
+
+      // Find the target header position
+      const targetHeaderPos = updatedContent.indexOf(`## ${targetHeader}\n`);
+      if (targetHeaderPos === -1) {
+        // If target header doesn't exist, create it and add the task
+        updatedContent += `\n## ${targetHeader}\n${task.fullMatch}\n`;
+      } else {
+        // Find where to insert in the target section
+        const insertPos = targetHeaderPos + `## ${targetHeader}\n`.length;
+
+        // Check if there's a "Complete" marker
+        const nextHeaderPos = updatedContent.indexOf('## ', insertPos);
+        const sectionEnd = nextHeaderPos !== -1 ? nextHeaderPos : updatedContent.length;
+        const sectionContent = updatedContent.substring(insertPos, sectionEnd);
+        const completeMarker = '**Complete**';
+        const hasCompleteMarker = sectionContent.includes(completeMarker);
+
+        let insertPosition;
+        if (hasCompleteMarker) {
+          const completePos = insertPos + sectionContent.indexOf(completeMarker);
+          insertPosition = completePos + completeMarker.length + 1;
+        } else {
+          insertPosition = insertPos;
+        }
+
+        // Insert task at the correct position
+        updatedContent = updatedContent.slice(0, insertPosition) +
+          task.fullMatch + '\n' +
+          updatedContent.slice(insertPosition);
+      }
+
+      tasksUpdated++;
+    }
+
+    if (tasksUpdated > 0) {
+      console.log(`Updated ${tasksUpdated} tasks in the Kanban board`);
+      await app.vault.modify(activeFile, updatedContent);
+    } else {
+      console.log('No tasks needed to be moved');
+    }
   }
 
   // Function to fetch Jira tasks
@@ -157,12 +244,73 @@ module.exports = async function (tp, jiraQuery, accountAliases, statusToHeadingM
     return file !== null;
   }
 
+  // Function to add new Jira tasks to the Kanban board
+  async function addNewTasks(kanbanContent, jiraTasks, statusToHeadingMap, activeFile) {
+    console.log('Starting to add new tasks to Kanban board');
+
+    // Extract existing task keys from the Kanban content
+    const existingTaskRegex = /\[\[([A-Z]+-\d+)\]\]/g;
+    const existingTaskKeys = new Set();
+    let match;
+
+    while ((match = existingTaskRegex.exec(kanbanContent)) !== null) {
+      existingTaskKeys.add(match[1]);
+    }
+
+    console.log(`Found ${existingTaskKeys.size} existing tasks in Kanban`);
+
+    // Identify new tasks that don't exist in the Kanban yet
+    const newTasks = jiraTasks.filter(task => !existingTaskKeys.has(task.key));
+    console.log(`Found ${newTasks.length} new tasks to add to Kanban`);
+
+    if (newTasks.length === 0) {
+      console.log('No new tasks to add');
+      return kanbanContent;
+    }
+
+    let updatedContent = kanbanContent;
+    let tasksAdded = 0;
+
+    // Add each new task to the appropriate section
+    for (const task of newTasks) {
+      const status = task.fields.status.name;
+      const targetHeader = statusToHeadingMap[status] || status;
+      const taskEntry = `- [ ] [[${task.key}]] ${task.fields.summary}\n`;
+
+      console.log(`Adding task ${task.key} to section "${targetHeader}"`);
+
+      // Find the target header position
+      const targetHeaderPos = updatedContent.indexOf(`## ${targetHeader}\n`);
+
+      if (targetHeaderPos === -1) {
+        // If target header doesn't exist, create it and add the task
+        console.log(`Creating new section "${targetHeader}" for task ${task.key}`);
+        updatedContent += `\n## ${targetHeader}\n${taskEntry}`;
+      } else {
+        // Find where to insert in the target section
+        const insertPos = targetHeaderPos + `## ${targetHeader}\n`.length;
+
+        // Insert task at the beginning of the section
+        updatedContent = updatedContent.slice(0, insertPos) +
+          taskEntry +
+          updatedContent.slice(insertPos);
+      }
+
+      tasksAdded++;
+    }
+
+    console.log(`Added ${tasksAdded} new tasks to the Kanban board`);
+    await app.vault.modify(activeFile, updatedContent);
+    return { content: updatedContent, addedCount: tasksAdded };
+  }
+
   // Expose functions to Templater
   return {
     updateKanbanWithJiraTasks,
     fetchJiraTasks,
     searchJiraIssues,
     extractHeadersFromContent,
-    fileExists
+    fileExists,
+    addNewTasks
   };
 };
